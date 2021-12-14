@@ -18,7 +18,7 @@ setup(
     packages=["fastrakdigitizer"],
     include_package_data=True,
     install_requires=[
-        'pyserial', 'PySide2', 'beepy', 'mne', 'numpy', 'pandas', 'trimesh'
+        'pyserial', 'PySide2', 'beepy', 'mne>=0.22', 'numpy', 'pandas', 'trimesh'
     ],
     entry_points={"console_scripts": ["fastrakdigitizer=fastrakdigitizer.main:main"]},
 )

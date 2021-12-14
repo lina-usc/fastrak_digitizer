@@ -10,6 +10,7 @@ from PySide2.Qt3DCore import Qt3DCore
 from PySide2.Qt3DExtras import Qt3DExtras
 from PySide2.Qt3DRender import Qt3DRender
 
+import open3d
 import configparser
 
 import os
@@ -20,7 +21,6 @@ import numpy as np
 import pandas as pd
 
 from mne.io.constants import FIFF
-from mne.coreg import get_mni_fiducials
 from mne.transforms import _get_trans, combine_transforms, Transform, apply_trans, transform_surface_to
 from mne.viz._3d import _fiducial_coords
 from mne.utils import get_subjects_dir
@@ -173,22 +173,24 @@ def sphere_mesh(pos, radius, color=None):
     return mesh
 
 
-def get_aligned_artifacts(info=None, trans=None, subject=None, subjects_dir=None, coord_frame='mri'):
+def get_aligned_artifacts(info=None, trans=None, subject=None, subjects_dir=None,
+                          coord_frame='mri', head_surf=None):
     head_mri_t, _ = _get_trans(trans, 'head', 'mri')
     dev_head_t, _ = _get_trans(info['dev_head_t'], 'meg', 'head')
     head_trans = head_mri_t
     mri_trans = Transform('mri', 'mri')
 
-    mri_fiducials = get_mni_fiducials(subject, subjects_dir)
+    mri_fiducials = mne.coreg.get_mni_fiducials(subject, subjects_dir)
     fid_loc = _fiducial_coords(mri_fiducials, FIFF.FIFFV_COORD_MRI)
     fid_loc = apply_trans(mri_trans, fid_loc)
     fid_loc = pd.DataFrame(fid_loc, index=[fid["ident"]._name.split("_")[-1] for fid in mri_fiducials],
                            columns=["x", "y", "z"])
 
-    subject_dir = Path(get_subjects_dir(subjects_dir, raise_error=True)) / subject
-    fname = subject_dir / 'bem' / 'sample-head.fif'
-    head_surf = read_bem_surfaces(fname)[0]
-    head_surf = transform_surface_to(head_surf, coord_frame, [mri_trans, head_trans], copy=True)
+    if head_surf is None:
+        subject_dir = Path(get_subjects_dir(subjects_dir, raise_error=True)) / subject
+        fname = subject_dir / 'bem' / 'sample-head.fif'
+        head_surf = read_bem_surfaces(fname)[0]
+        head_surf = transform_surface_to(head_surf, coord_frame, [mri_trans, head_trans], copy=True)
 
     eeg_picks = mne.pick_types(info, meg=False, eeg=True, ref_meg=False)
     eeg_loc = np.array([info['chs'][k]['loc'][:3] for k in eeg_picks])
@@ -352,7 +354,7 @@ class CmdReceivedWidget(QtWidgets.QWidget):
          self.received_cmds.verticalScrollBar().setValue(pos)
 
 
-class MeshDisplayWidget(QtWidgets.QWidget):
+class MeshDisplayWidget(QtWidgets.QSplitter):
     def __init__(self, parent, fs_subject="sample"):
         super(MeshDisplayWidget, self).__init__(parent)
 
@@ -366,8 +368,9 @@ class MeshDisplayWidget(QtWidgets.QWidget):
         self.container.setMinimumSize(QtCore.QSize(600, 100))
         self.container.setMaximumSize(screen_size)
 
-        h_layout = QtWidgets.QHBoxLayout(self)
-        h_layout.addWidget(self.container)
+        #h_layout = QtWidgets.QHBoxLayout(self)
+        #h_layout.addWidget(self.container)
+        self.addWidget(self.container)
 
         self.tableView = QtWidgets.QTableView(self)
         self.tableView.setObjectName("tableView")
@@ -422,7 +425,10 @@ class MeshDisplayWidget(QtWidgets.QWidget):
             else:
                 self.open_subject_dir_dlg()
 
-        h_layout.addLayout(v_layout)
+        #h_layout.addLayout(v_layout)
+        v_layout_widget = QtWidgets.QWidget(self)
+        v_layout_widget.setLayout(v_layout)
+        self.addWidget(v_layout_widget)
 
         self.data = QtCore.QUrl.fromLocalFile(str(Path(__file__).parent.absolute() / f"{self.fs_subject}_head.obj"))
 
@@ -464,11 +470,18 @@ class MeshDisplayWidget(QtWidgets.QWidget):
 
         eeg, fid, surf = get_aligned_artifacts(raw.info, subject=self.fs_subject, trans=trans,
                                                subjects_dir=fs_subjects_dir, coord_frame='mri')
+        self.head_surf = surf
 
         path_out = Path(str(Path(__file__).parent.absolute() / f"{self.fs_subject}_head.obj"))
-        if not path_out.exists():
+        if True: #not path_out.exists():
+            mesh = trimesh.Trimesh(surf["rr"] * 1000, surf["tris"])
+            open3d_mesh = open3d.geometry.TriangleMesh(vertices=open3d.utility.Vector3dVector(mesh.vertices),
+                                                       triangles=open3d.utility.Vector3iVector(mesh.faces))
+            mesh = open3d_mesh.simplify_quadric_decimation(int(20000))
+            mesh = trimesh.Trimesh(np.asarray(mesh.vertices), np.asarray(mesh.triangles))
+
             with path_out.open('w') as file_obj:
-                file_obj.write(trimesh.exchange.obj.export_obj(trimesh.Trimesh(surf["rr"] * 1000, surf["tris"])))
+                file_obj.write(trimesh.exchange.obj.export_obj(mesh))
 
         # Head
         self.data = QtCore.QUrl.fromLocalFile(str(path_out))
@@ -484,7 +497,7 @@ class MeshDisplayWidget(QtWidgets.QWidget):
         self.camController = Qt3DExtras.QOrbitCameraController(self.head_mesh)
         self.camController.setCamera(self.camera)
         self.camController.setLinearSpeed(self.camController.linearSpeed()*100)
-        self.mesh_center_of_mass = surf['rr'].mean(0)*1000
+        self.mesh_center_of_mass = np.median(surf['rr'], 0)*1000
         self.camera.setViewCenter(QtGui.QVector3D(*(self.mesh_center_of_mass)))
 
         self.camera.viewCenterChanged.connect(self.cam_view_center_changed)
@@ -648,7 +661,8 @@ class MeshDisplayWidget(QtWidgets.QWidget):
             self.config.write(configfile)
 
     def cam_view_center_changed(self):
-        self.camera.setViewCenter(QtGui.QVector3D(*(self.mesh_center_of_mass)))
+        self.camera.setViewCenter(QtGui.QVector3D(*self.mesh_center_of_mass))
+        #self.camera.translateWorld(QtGui.QVector3D(*np.array([0, 0, 100])), Qt3DRender.QCamera.TranslateViewCenter)
 
     def handleSelectionChanged(self, selected, deselected):
         index = self.selection.selectedRows()[0]
@@ -720,7 +734,8 @@ class MeshDisplayWidget(QtWidgets.QWidget):
 
         trans = mne.read_trans(f"{self.config['DEFAULT']['subject_dir']}/{self.subject}-trans.fif")
         eeg, fid, surf = get_aligned_artifacts(raw.info, subject=self.fs_subject, trans=trans,
-                                               subjects_dir=fs_subjects_dir, coord_frame='mri')
+                                               subjects_dir=fs_subjects_dir, coord_frame='mri',
+                                               head_surf=self.head_surf)[:2]
 
         for label in fid.index.values:
             self.add_acq_sphere(fid, label)
@@ -827,10 +842,36 @@ class FastrakWidget(QtWidgets.QSplitter):
             self.com_thread.text_read.disconnect(self.receive_wgt.command_received)
             self.com_thread = None
 
+    def eventFilter(self, widget, event):
+
+        '''if event.type() == QtCore.QEvent.KeyPress:
+
+            print(event.key())
+            # on j
+            if event.key() == QtCore.Qt.Key_J:
+
+                print('j')
+                return True
+
+            # on k
+            elif event.key() == QtCore.Qt.Key_K:
+
+                print('k')
+                return True
+
+            # on l - this if statement is never true!
+            elif event.key() == QtCore.Qt.Key_L:
+
+                print('l')
+                return True
+        '''
+        return False
+
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
     window = FastrakWidget()
+    app.installEventFilter(window)
     sys.exit(app.exec_())
 
 
