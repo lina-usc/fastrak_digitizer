@@ -1,0 +1,8 @@
+pyserial
+PySide2
+beepy
+mne>=0.22
+numpy
+pandas
+trimesh
+open3d

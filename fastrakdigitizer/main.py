@@ -32,77 +32,23 @@ import trimesh
 config_path = str(Path(__file__).parent.absolute() / 'config.ini')
 
 
-def recover_homogenous_affine_trans(points1, points2):
-    '''
-    Find the unique homogeneous affine transformation that
-    maps a set of 3 points to another set of 3 points in 3D
-    space:
+def correct_for_movements(df):
+    df = df.copy()
+    refs = [np.array([row[[f"x{i}", f"y{i}", f"z{i}"]] for i in range(2, 5)])
+            for _, row in df.iterrows()]
 
-        p_prime == np.dot(p, R) + t
+    point0 = df.iloc[0][["x1", "y1", "z1"]]
+    ref0 = refs[0]
 
-    where `R` is an unknown rotation matrix, `t` is an unknown
-    translation vector, and `p` and `p_prime` are the original
-    and transformed set of points stored as row vectors:
+    points_out = [point0.values]
+    for refi, pointi in zip(refs[1:], df.iloc[1:][["x1", "y1", "z1"]].values):
+        trans = mne.coreg.fit_matched_points(refi, ref0, out='trans', scale=False)
 
-        p       = np.array((p1,       p2,       p3))
-        p_prime = np.array((p1_prime, p2_prime, p3_prime))
+        points_out.append(mne.transforms.apply_trans(trans, pointi))
 
-    The result of this function is an augmented 4-by-4
-    matrix `A` that represents this affine transformation:
-
-        np.column_stack((p_prime, (1, 1, 1))) == \
-            np.dot(np.column_stack((p, (1, 1, 1))), A)
-
-    Source: https://math.stackexchange.com/a/222170 (robjohn)
-    '''
-
-    # construct intermediate matrix
-    Q = points1[1:] - points1[0]
-    Q_prime = points2[1:] - points2[0]
-
-    # calculate rotation matrix
-    R = np.dot(np.linalg.inv(np.row_stack((Q, np.cross(*Q)))),
-               np.row_stack((Q_prime, np.cross(*Q_prime))))
-
-    # calculate translation vector
-    t = points2[0] - np.dot(points1[0], R)
-
-    # calculate affine transformation matrix
-    return np.column_stack((np.row_stack((R, t)),
-                            (0, 0, 0, 1))).T
-
-
-def apply_transform(points, trans_mat):
-    # If trans_mat is obtained with recover_homogenous_affine_trans(points1, points2),
-    # then apply_transform(points1, trans_mat) == points2
-    points = np.array(points)
-    a = np.hstack([points, np.ones((points.shape[0], 1))])
-    ap = np.dot(trans_mat, a.T).T[:, :3]
-    return ap
-
-
-def get_movement_correct_dig(ref_triad, dig_triad, dig):
-    """
-     Using three reference point to correct for movements
-     during acquisition.
-     ref_triad: a 3x3 matrix of three points used as a reference.
-     dig_triad: a 3x3 matrix of the position for these three points, possibly moved in spaced comparted to the ref_triad
-     dig: a 1x3 point digitized as the same time as the dig_triad
-    """
-
-    trans_mat = recover_homogenous_affine_trans(dig_triad, ref_triad)
-    return apply_transform(dig, trans_mat)
-
-
-def correct_for_movements(df_in):
-    df = df_in.copy()
-    ref_triad = df.iloc[0, 3:].values.reshape((3, 3))
-    for i in range(1, df.shape[0]):
-        dig_triad = df.iloc[i, 3:].values.reshape((3, 3))
-        dig = [df.iloc[i, :3].values]
-        df.iloc[i, :3] = get_movement_correct_dig(ref_triad, dig_triad, dig)[0]
-        df.iloc[i, 3:] = ref_triad.reshape([9])
+    df.loc[:, "x1":"z1"] = np.array(points_out)
     return df
+
 
 
 class DataFrameModel(QtCore.QAbstractTableModel):
@@ -140,7 +86,7 @@ class DataFrameModel(QtCore.QAbstractTableModel):
     def columnCount(self, parent=QtCore.QModelIndex()):
         if parent.isValid():
             return 0
-        return 3 #self._dataframe.columns.size
+        return 3  # self._dataframe.columns.size
 
     def data(self, index, role=QtCore.Qt.DisplayRole):
         if not index.isValid() or not (0 <= index.row() < self.rowCount() and 0 <= index.column() < self.columnCount()):
@@ -173,32 +119,6 @@ def sphere_mesh(pos, radius, color=None):
     return mesh
 
 
-def get_aligned_artifacts(info=None, trans=None, subject=None, subjects_dir=None,
-                          coord_frame='mri', head_surf=None):
-    head_mri_t, _ = _get_trans(trans, 'head', 'mri')
-    dev_head_t, _ = _get_trans(info['dev_head_t'], 'meg', 'head')
-    head_trans = head_mri_t
-    mri_trans = Transform('mri', 'mri')
-
-    mri_fiducials = mne.coreg.get_mni_fiducials(subject, subjects_dir)
-    fid_loc = _fiducial_coords(mri_fiducials, FIFF.FIFFV_COORD_MRI)
-    fid_loc = apply_trans(mri_trans, fid_loc)
-    fid_loc = pd.DataFrame(fid_loc, index=[fid["ident"]._name.split("_")[-1] for fid in mri_fiducials],
-                           columns=["x", "y", "z"])
-
-    if head_surf is None:
-        subject_dir = Path(get_subjects_dir(subjects_dir, raise_error=True)) / subject
-        fname = subject_dir / 'bem' / 'sample-head.fif'
-        head_surf = read_bem_surfaces(fname)[0]
-        head_surf = transform_surface_to(head_surf, coord_frame, [mri_trans, head_trans], copy=True)
-
-    eeg_picks = mne.pick_types(info, meg=False, eeg=True, ref_meg=False)
-    eeg_loc = np.array([info['chs'][k]['loc'][:3] for k in eeg_picks])
-    eeg_loc = apply_trans(head_trans, eeg_loc)
-    eegp_loc = _project_onto_surface(eeg_loc, head_surf, project_rrs=True, return_nn=True)[2]
-    eegp_loc = pd.DataFrame(eegp_loc, index=[ch["ch_name"] for ch in info['chs']], columns=["x", "y", "z"])
-
-    return eegp_loc, fid_loc, head_surf
 
 
 class ComThread(QtCore.QThread):
@@ -353,6 +273,51 @@ class CmdReceivedWidget(QtWidgets.QWidget):
          pos = self.received_cmds.verticalScrollBar().maximum()
          self.received_cmds.verticalScrollBar().setValue(pos)
 
+import matplotlib.pyplot as plt
+def save_diagnostic_plot(csv_path):
+    def correct_mvt(df):
+        df = df.copy()
+        refs = [np.array([row[[f"x{i}", f"y{i}", f"z{i}"]] for i in range(2, 5)])
+                for _, row in df.iterrows()]
+
+        point0 = df.iloc[0][["x1", "y1", "z1"]]
+        ref0 = refs[0]
+
+        points_out = [point0.values]
+        for refi, pointi in zip(refs[1:], df.iloc[1:][["x1", "y1", "z1"]].values):
+            trans = mne.coreg.fit_matched_points(refi, ref0, out='trans', scale=False)
+
+            points_out.append(mne.transforms.apply_trans(trans, pointi))
+
+        df.loc[:, "x1":"z1"] = np.array(points_out)
+        return df
+
+    df = pd.read_csv(csv_path, index_col=0)
+    corrected_df = correct_mvt(df)
+
+    fig = plt.figure()
+    ax = fig.add_subplot(projection='3d')
+    X, Y, Z = df.x1, df.y1, df.z1
+    ax.scatter(X, Y, Z)
+
+    max_range = np.array([X.max()-X.min(), Y.max()-Y.min(), Z.max()-Z.min()]).max() / 2.0
+
+    mid_x = (X.max()+X.min()) * 0.5
+    mid_y = (Y.max()+Y.min()) * 0.5
+    mid_z = (Z.max()+Z.min()) * 0.5
+    ax.set_xlim(mid_x - max_range, mid_x + max_range)
+    ax.set_ylim(mid_y - max_range, mid_y + max_range)
+    ax.set_zlim(mid_z - max_range, mid_z + max_range)
+
+    ax.set_xlabel('X Label')
+    ax.set_ylabel('Y Label')
+    ax.set_zlabel('Z Label')
+
+    ax.scatter(*corrected_df[["x1", "y1", "z1"]].values.T)
+    for azim in [0, 45, 90]:
+        ax.view_init(elev=20., azim=azim)
+        fig.savefig(csv_path[:-4] + f"_{azim}.png")
+
 
 class MeshDisplayWidget(QtWidgets.QSplitter):
     def __init__(self, parent, fs_subject="sample"):
@@ -410,21 +375,6 @@ class MeshDisplayWidget(QtWidgets.QSplitter):
         v_layout.addLayout(subject_dir_layout)
         self.subject_dir_wgt.textChanged.connect(self.set_subject_dir)
 
-        if not Path(self.config["DEFAULT"]["subject_dir"]).exists():
-            msgBox = QtWidgets.QMessageBox()
-            msgBox.setIcon(QtWidgets.QMessageBox.Information)
-            msgBox.setText(f"The chosen subject directory (i.e. {self.config['DEFAULT']['subject_dir']}) does not "
-                           "exist. Do you want to create it or to select a new directory?")
-            msgBox.setWindowTitle("Non-existent subject directory")
-
-            button_create = msgBox.addButton("Create it!", QtWidgets.QMessageBox.YesRole);
-            msgBox.addButton("Select a different directory", QtWidgets.QMessageBox.NoRole)
-            msgBox.exec_()
-            if msgBox.clickedButton() == button_create:
-                Path(self.config["DEFAULT"]["subject_dir"]).mkdir(exist_ok=True, parents=True)
-            else:
-                self.open_subject_dir_dlg()
-
         #h_layout.addLayout(v_layout)
         v_layout_widget = QtWidgets.QWidget(self)
         v_layout_widget.setLayout(v_layout)
@@ -459,7 +409,7 @@ class MeshDisplayWidget(QtWidgets.QSplitter):
 
         # Get co-registered head, fiducials and electrodes
         data_path = Path(mne.datasets.sample.data_path())
-        fs_subjects_dir = data_path / 'subjects'
+        self.fs_subjects_dir = Path(get_subjects_dir(data_path / 'subjects', raise_error=True))
         trans_fname = data_path / 'MEG' / 'sample' / 'sample_audvis_raw-trans.fif'
         trans = mne.read_trans(trans_fname)
 
@@ -468,16 +418,20 @@ class MeshDisplayWidget(QtWidgets.QSplitter):
         raw = mne.io.RawArray(np.zeros((len(montage.ch_names), 100)), info)
         raw.set_montage(montage)
 
-        eeg, fid, surf = get_aligned_artifacts(raw.info, subject=self.fs_subject, trans=trans,
-                                               subjects_dir=fs_subjects_dir, coord_frame='mri')
-        self.head_surf = surf
+        surf_path = self.fs_subjects_dir / self.fs_subject / 'bem' / 'sample-head.fif'
+        self.head_surf = transform_surface_to(surf=read_bem_surfaces(surf_path)[0],
+                                              dest="mri",
+                                              trans=_get_trans(trans, 'head', 'mri'),
+                                              copy=True)
+
+        eeg, fid = self.get_aligned_artifacts(raw.info)
 
         path_out = Path(str(Path(__file__).parent.absolute() / f"{self.fs_subject}_head.obj"))
-        if True: #not path_out.exists():
-            mesh = trimesh.Trimesh(surf["rr"] * 1000, surf["tris"])
+        if not path_out.exists():
+            mesh = trimesh.Trimesh(self.head_surf["rr"] * 1000, self.head_surf["tris"])
             open3d_mesh = open3d.geometry.TriangleMesh(vertices=open3d.utility.Vector3dVector(mesh.vertices),
                                                        triangles=open3d.utility.Vector3iVector(mesh.faces))
-            mesh = open3d_mesh.simplify_quadric_decimation(int(20000))
+            mesh = open3d_mesh.simplify_quadric_decimation(int(10000))
             mesh = trimesh.Trimesh(np.asarray(mesh.vertices), np.asarray(mesh.triangles))
 
             with path_out.open('w') as file_obj:
@@ -497,7 +451,7 @@ class MeshDisplayWidget(QtWidgets.QSplitter):
         self.camController = Qt3DExtras.QOrbitCameraController(self.head_mesh)
         self.camController.setCamera(self.camera)
         self.camController.setLinearSpeed(self.camController.linearSpeed()*100)
-        self.mesh_center_of_mass = np.median(surf['rr'], 0)*1000
+        self.mesh_center_of_mass = np.median(self.head_surf['rr'], 0)*1000
         self.camera.setViewCenter(QtGui.QVector3D(*(self.mesh_center_of_mass)))
 
         self.camera.viewCenterChanged.connect(self.cam_view_center_changed)
@@ -538,11 +492,49 @@ class MeshDisplayWidget(QtWidgets.QSplitter):
         self.tableView.setModel(model)
         self.df_acq.loc[:, :] = np.nan
 
+        if not Path(self.config["DEFAULT"]["subject_dir"]).exists():
+            msgBox = QtWidgets.QMessageBox()
+            msgBox.setIcon(QtWidgets.QMessageBox.Information)
+            msgBox.setText(f"The chosen subject directory (i.e. {self.config['DEFAULT']['subject_dir']}) does not "
+                           "exist. Do you want to create it or to select a new directory?")
+            msgBox.setWindowTitle("Non-existent subject directory")
+
+            button_create = msgBox.addButton("Create it!", QtWidgets.QMessageBox.YesRole);
+            msgBox.addButton("Select a different directory", QtWidgets.QMessageBox.NoRole)
+            msgBox.exec_()
+            if msgBox.clickedButton() == button_create:
+                Path(self.config["DEFAULT"]["subject_dir"]).mkdir(exist_ok=True, parents=True)
+            else:
+                self.open_subject_dir_dlg()
+
         self.set_table_view_selection(0)
         self.view.setRootEntity(self.root_entity)
 
         self.subject_name_wgt.currentTextChanged.connect(self.load_subject)
         self.update_subject_lst()
+
+    def get_aligned_artifacts(self, info=None):
+        mri_fiducials = mne.coreg.get_mni_fiducials(self.fs_subject, self.fs_subjects_dir)
+        mri_fid_loc = pd.DataFrame(np.array([fid["r"] for fid in mri_fiducials]),
+                                   index=[fid["ident"]._name.split("_")[-1] for fid in mri_fiducials],
+                                   columns=["x", "y", "z"])
+
+        eeg_picks = mne.pick_types(info, meg=False, eeg=True, ref_meg=False)
+        eeg_loc = np.array([info['chs'][k]['loc'][:3] for k in eeg_picks])
+
+        cap_fid_loc = pd.DataFrame(np.array([fid["r"] for fid in info["dig"][:3]]),
+                                   index=[fid["ident"] for fid in info["dig"][:3]],
+                                   columns=["x", "y", "z"])
+
+        trans = mne.coreg.fit_matched_points(cap_fid_loc.values, mri_fid_loc.values, out='trans', scale=True)
+
+        eeg_loc = apply_trans(trans, eeg_loc)
+        eegp_loc = _project_onto_surface(eeg_loc, self.head_surf, project_rrs=True,
+                                         return_nn=True, method="nearest neighbor")[2]
+
+        eegp_loc = pd.DataFrame(eegp_loc, index=[ch["ch_name"] for ch in info['chs']], columns=["x", "y", "z"])
+
+        return eegp_loc, mri_fid_loc
 
     def update_channel_material_all(self):
         for label in self.coordinate_entities:
@@ -596,7 +588,7 @@ class MeshDisplayWidget(QtWidgets.QSplitter):
         else:
             subject_name = f"subject{int(existing_subjects[-1][8:13])+1:05}"
 
-        subject_name, ok = QtWidgets.QInputDialog.getText(self, 'text', 'Enter some text',
+        subject_name, ok = QtWidgets.QInputDialog.getText(self, 'Subject ID', 'Please enter the ID for this subject',
                                                           QtWidgets.QLineEdit.Normal, subject_name)
         if ok:
             if Path(f"{self.config['DEFAULT']['subject_dir']}/{subject_name}_df_acq.csv").exists():
@@ -697,13 +689,16 @@ class MeshDisplayWidget(QtWidgets.QSplitter):
         if not np.any(np.isnan(self.df_acq.loc[["NASION", "LPA", "RPA"]].values)):
             self.save_montage_and_trans()
             self.add_acq_coordinates()
+            save_diagnostic_plot(f"{self.config['DEFAULT']['subject_dir']}/{self.subject}_df_acq.csv")
 
     def clear_acq_spheres(self):
-        for label in self.acq_coordinate_meshes:
+        """for label in self.acq_coordinate_meshes:
+            print("####", label)
             self.root_entity.removeComponent(self.acq_coordinate_meshes[label])
         self.acq_coordinate_meshes = {}
         self.acq_coordinate_entities = {}
-        self.acq_coordinate_transforms = {}
+        self.acq_coordinate_transforms = {}"""
+        pass
 
     def add_acq_sphere(self, df, label):
         pos = df.loc[label, ["x", "y", "z"]].values*1000  # m to mm
@@ -719,9 +714,6 @@ class MeshDisplayWidget(QtWidgets.QSplitter):
         self.acq_coordinate_transforms[label].setTranslation(QtGui.QVector3D(*pos))
 
     def add_acq_coordinates(self):
-        data_path = Path(mne.datasets.sample.data_path())
-        fs_subjects_dir = data_path / 'subjects'
-
         montage = self.get_acq_montage()
         print("montage", montage)
         if montage is None:
@@ -732,10 +724,7 @@ class MeshDisplayWidget(QtWidgets.QSplitter):
         raw = mne.io.RawArray(np.zeros((len(montage.ch_names), 100)), info)
         raw.set_montage(montage)
 
-        trans = mne.read_trans(f"{self.config['DEFAULT']['subject_dir']}/{self.subject}-trans.fif")
-        eeg, fid, surf = get_aligned_artifacts(raw.info, subject=self.fs_subject, trans=trans,
-                                               subjects_dir=fs_subjects_dir, coord_frame='mri',
-                                               head_surf=self.head_surf)[:2]
+        eeg, fid = self.get_aligned_artifacts(raw.info)
 
         for label in fid.index.values:
             self.add_acq_sphere(fid, label)
@@ -765,23 +754,20 @@ class MeshDisplayWidget(QtWidgets.QSplitter):
             print("Return no montage")
             return
 
-        montage_fid.save(f"{self.config['DEFAULT']['subject_dir']}/{self.subject}-montage.fif")
+        montage_fid.save(f"{self.config['DEFAULT']['subject_dir']}/{self.subject}-montage.fif",
+                         overwrite=True)
         self.save_montage_tsv()
 
         df_acq = correct_for_movements(self.df_acq).dropna()
         mri_pts = self.df_montage.loc[df_acq.index.values].values
         mtg_pts = df_acq.values[:, :3]
 
-        trans_mat = recover_homogenous_affine_trans(mtg_pts[:3], mri_pts[:3])
-        # rx, ry, rz, tx, ty, tz, sx, sy, sz
-        x0 = [*mne.transforms.rotation_angles(trans_mat), *trans_mat[:3, 3], 1.0, 1.0, 1.0]
-        n_scale_params = 3
-        trans = mne.coreg.fit_matched_points(mtg_pts, mri_pts, x0=x0, out='trans',
-                                             scale=n_scale_params) #, weights=(1.0, 10.0, 1.0))
+        trans = mne.coreg.fit_matched_points(mtg_pts, mri_pts, out='trans', scale=True)
         trans = mne.Transform('head', 'mri', trans)
+
         trans_file_name = mne.coreg.trans_fname.format(raw_dir=self.config["DEFAULT"]['subject_dir'],
                                                        subject=self.subject)
-        mne.write_trans(trans_file_name, trans)
+        mne.write_trans(trans_file_name, trans, overwrite=True)
 
 
 class FastrakWidget(QtWidgets.QSplitter):
